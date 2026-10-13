@@ -1,0 +1,231 @@
+name: CI/CD Pipeline - Test & Deploy to InfinityFree
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Apply least privilege permissions
+permissions:
+  contents: read
+
+# Prevent concurrent deployments to avoid corrupted or partially overwritten production releases
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  # =========================================================================
+  # 1. CONTINUOUS INTEGRATION (CI)
+  # =========================================================================
+  ci:
+    name: Continuous Integration (Lint, Validate & Test)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect PHP Version
+        id: detect-php
+        run: |
+          DEFAULT_PHP="8.2"
+          DETECTED_PHP=""
+          
+          if [ -f "composer.json" ]; then
+            DETECTED_PHP=$(grep -oE '"php"\s*:\s*"[^"]+"' composer.json | grep -oE '[0-9]+\.[0-9]+' | head -n 1 || true)
+          fi
+          
+          if [ -n "$DETECTED_PHP" ]; then
+            echo "Detected PHP version from composer.json: $DETECTED_PHP"
+            echo "version=$DETECTED_PHP" >> $GITHUB_OUTPUT
+          else
+            echo "No explicit PHP version constraint found. Using InfinityFree target PHP version: $DEFAULT_PHP"
+            echo "version=$DEFAULT_PHP" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup PHP Environment
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ steps.detect-php.outputs.version }}
+          extensions: mbstring, xml, ctype, iconv, intl, pdo, pdo_mysql, mysqli, json, curl
+          coverage: none
+          tools: composer:v2
+
+      - name: Verify Configuration Security & Required Templates
+        run: |
+          echo "=== Auditing Repository Configuration Files ==="
+          SECURITY_VIOLATION=0
+          
+          # 1. Guard against committing production secrets or live env files
+          if [ -f ".env" ]; then
+            echo "::error::Security Violation: Sensitive file '.env' was detected in the repository! Remove it from git immediately."
+            SECURITY_VIOLATION=1
+          fi
+          if [ -f "config.local.php" ]; then
+            echo "::error::Security Violation: Sensitive file 'config.local.php' was detected in the repository! Remove it from git immediately."
+            SECURITY_VIOLATION=1
+          fi
+          
+          # 2. Check for required configuration template
+          if [ ! -f ".env.example" ] && [ ! -f "config.example.php" ]; then
+            echo "::warning::Missing environment template file (.env.example or config.example.php)."
+          else
+            echo "Environment configuration templates found."
+          fi
+          
+          if [ $SECURITY_VIOLATION -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Validate PHP Syntax (Linting)
+        run: |
+          echo "=== Validating PHP Syntax ==="
+          PHP_FILES=$(find . -type f -name "*.php" -not -path "*/vendor/*" -not -path "*/node_modules/*")
+          if [ -z "$PHP_FILES" ]; then
+            echo "No PHP files found in repository to lint."
+          else
+            ERRORS=0
+            while IFS= read -r file; do
+              if ! php -l "$file"; then
+                ERRORS=$((ERRORS + 1))
+              fi
+            done <<< "$PHP_FILES"
+            
+            if [ $ERRORS -ne 0 ]; then
+              echo "::error::PHP syntax linting failed on $ERRORS file(s)."
+              exit 1
+            fi
+            echo "All PHP files passed syntax validation."
+          fi
+
+      - name: Validate Composer Configuration
+        if: hashFiles('composer.json') != ''
+        run: |
+          echo "=== Validating composer.json ==="
+          composer validate --strict
+
+      - name: Cache Composer Dependencies
+        if: hashFiles('composer.json') != ''
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock', '**/composer.json') }}
+          restore-keys: |
+            ${{ runner.os }}-composer-
+
+      - name: Install Composer Dependencies
+        if: hashFiles('composer.json') != ''
+        run: |
+          echo "=== Installing Dependencies ==="
+          if [ -f "composer.lock" ]; then
+            composer install --no-interaction --prefer-dist --optimize-autoloader --no-progress
+          else
+            composer install --no-interaction --prefer-dist --optimize-autoloader --no-progress || composer update --no-interaction --prefer-dist --optimize-autoloader --no-progress
+          fi
+
+      - name: Run PHPUnit Tests
+        run: |
+          echo "=== Checking Automated Test Suite ==="
+          if [ -f "vendor/bin/phpunit" ]; then
+            echo "Executing project tests via vendor/bin/phpunit..."
+            ./vendor/bin/phpunit
+          elif [ -f "phpunit.xml" ] || [ -f "phpunit.xml.dist" ]; then
+            echo "PHPUnit configuration file detected."
+            if command -v phpunit >/dev/null 2>&1; then
+              phpunit
+            elif [ -f "composer.json" ]; then
+              echo "Installing standalone PHPUnit..."
+              composer global require phpunit/phpunit --no-interaction --prefer-dist
+              ~/.composer/vendor/bin/phpunit
+            else
+              echo "No vendor autoloader or phpunit binary installed. Skipping PHPUnit execution until dependencies are installed."
+            fi
+          else
+            echo "No test suite or phpunit.xml configured. Skipping test execution."
+          fi
+
+  # =========================================================================
+  # 2. CONTINUOUS DEPLOYMENT (CD)
+  # =========================================================================
+  deploy:
+    name: Continuous Deployment (FTP to InfinityFree)
+    needs: ci
+    if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Verify Required Secrets
+        run: |
+          MISSING_SECRETS=0
+          if [ -z "${{ secrets.FTP_HOSTNAME }}" ]; then
+            echo "::error::Missing GitHub Secret: FTP_SERVER"
+            MISSING_SECRETS=1
+          fi
+          if [ -z "${{ secrets.FTP_USERNAME }}" ]; then
+            echo "::error::Missing GitHub Secret: FTP_USERNAME"
+            MISSING_SECRETS=1
+          fi
+          if [ -z "${{ secrets.FTP_PASSWORD }}" ]; then
+            echo "::error::Missing GitHub Secret: FTP_PASSWORD"
+            MISSING_SECRETS=1
+          fi
+          
+          if [ $MISSING_SECRETS -ne 0 ]; then
+            echo "::error::Deployment halted: Please set FTP_SERVER, FTP_USERNAME, and FTP_PASSWORD in your GitHub repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "Required deployment secrets are present."
+
+      - name: Deploy to InfinityFree via FTP
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.6
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftp
+          port: 21
+          local-dir: ./
+          server-dir: /htdocs/
+          dangerous-clean-slate: false
+          exclude: |
+            **/.git*
+            **/.git*/**
+            **/.github/**
+            **/.vscode/**
+            **/.idea/**
+            **/tests/**
+            **/tests*/**
+            **/phpunit.xml*
+            **/composer.json
+            **/composer.lock
+            **/package.json
+            **/package-lock.json
+            **/yarn.lock
+            **/gulpfile.js
+            **/.env*
+            **/config.local.php
+            **/core/config/config.local.php
+            **/*.sql
+            **/*.sqlite
+            **/*.log
+            **/*.tmp
+            **/*.bak
+            **/*.swp
+            **/node_modules/**
+            **/README.md
+            **/scratch/**
+            **/scratch_*
+            **/test_*
+            **/check_*
