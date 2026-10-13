@@ -169,21 +169,21 @@ jobs:
       - name: Verify Required Secrets
         run: |
           MISSING_SECRETS=0
-          if [ -z "${{ secrets.FTP_HOSTNAME }}" ]; then
-            echo "::error::Missing GitHub Secret: FTP_SERVER"
+          if [ -z "${{ secrets.FTP_SERVER || secrets.FTP_HOSTNAME || secrets.FTP_HOST }}" ]; then
+            echo "::error::Missing GitHub Secret: FTP_SERVER (or FTP_HOSTNAME)"
             MISSING_SECRETS=1
           fi
-          if [ -z "${{ secrets.FTP_USERNAME }}" ]; then
+          if [ -z "${{ secrets.FTP_USERNAME || secrets.FTP_USER }}" ]; then
             echo "::error::Missing GitHub Secret: FTP_USERNAME"
             MISSING_SECRETS=1
           fi
-          if [ -z "${{ secrets.FTP_PASSWORD }}" ]; then
+          if [ -z "${{ secrets.FTP_PASSWORD || secrets.FTP_PASS }}" ]; then
             echo "::error::Missing GitHub Secret: FTP_PASSWORD"
             MISSING_SECRETS=1
           fi
           
           if [ $MISSING_SECRETS -ne 0 ]; then
-            echo "::error::Deployment halted: Please set FTP_SERVER, FTP_USERNAME, and FTP_PASSWORD in your GitHub repository Settings -> Secrets and variables -> Actions."
+            echo "::error::Deployment halted: Please set FTP_SERVER (or FTP_HOSTNAME), FTP_USERNAME, and FTP_PASSWORD in your GitHub repository Settings -> Secrets and variables -> Actions."
             exit 1
           fi
           echo "Required deployment secrets are present."
@@ -191,9 +191,9 @@ jobs:
       - name: Deploy to InfinityFree via FTP
         uses: SamKirkland/FTP-Deploy-Action@v4.3.6
         with:
-          server: ${{ secrets.FTP_SERVER }}
-          username: ${{ secrets.FTP_USERNAME }}
-          password: ${{ secrets.FTP_PASSWORD }}
+          server: ${{ secrets.FTP_SERVER || secrets.FTP_HOSTNAME || secrets.FTP_HOST }}
+          username: ${{ secrets.FTP_USERNAME || secrets.FTP_USER }}
+          password: ${{ secrets.FTP_PASSWORD || secrets.FTP_PASS }}
           protocol: ftp
           port: 21
           local-dir: ./
